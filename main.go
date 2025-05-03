@@ -4,17 +4,26 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/klauspost/reedsolomon"
 )
 
 func main() {
-	// Configuration
-	const dataShards = 4   // Number of data shards
-	const parityShards = 2 // Number of parity shards
-	const totalShards = dataShards + parityShards
+	// Configuration with validation
+	const (
+		dataShards   = 4
+		parityShards = 2
+		totalShards  = dataShards + parityShards
+		maxShardSize = 1 << 24 // 16MB max per shard (adjust as needed)
+	)
 
-	// 1. Create a Reed-Solomon encoder
+	// Validate configuration before proceeding
+	if dataShards <= 0 || parityShards <= 0 {
+		log.Fatal("Both dataShards and parityShards must be positive integers")
+	}
+
+	// 1. Create a Reed-Solomon encoder with validation
 	enc, err := reedsolomon.New(dataShards, parityShards)
 	if err != nil {
 		log.Fatalf("Failed to create encoder: %v", err)
@@ -23,129 +32,166 @@ func main() {
 	fmt.Println("Reed-Solomon encoder created successfully")
 	fmt.Printf("Configuration: %d data shards + %d parity shards = %d total shards\n",
 		dataShards, parityShards, totalShards)
+	fmt.Printf("Can recover from up to %d lost shards\n", parityShards)
 
-	// 2. Prepare our original data
+	// 2. Prepare our original data with size validation
 	originalData := []byte("This is our super important data that needs protection. " +
 		"It contains critical information that we can't afford to lose!")
 
-	// Ensure the data length is appropriate for our shard configuration
-	if len(originalData)%dataShards != 0 {
-		// Pad the data if needed
-		padding := make([]byte, dataShards-(len(originalData)%dataShards))
-		originalData = append(originalData, padding...)
+	if len(originalData) == 0 {
+		log.Fatal("Input data cannot be empty")
+	}
+	if len(originalData) > maxShardSize*dataShards {
+		log.Fatal("Input data too large for current configuration")
 	}
 
-	fmt.Printf("\nOriginal data (%d bytes):\n%s\n", len(originalData), originalData)
+	// Pad data to fit shard boundaries if needed
+	paddedLength := len(originalData)
+	if len(originalData)%dataShards != 0 {
+		padding := dataShards - (len(originalData) % dataShards)
+		originalData = append(originalData, make([]byte, padding)...)
+		fmt.Printf("Added %d bytes of padding to align with shard boundaries\n", padding)
+	}
 
-	// 3. Split the data into shards
+	fmt.Printf("\nOriginal data (%d bytes):\n%s\n", paddedLength, originalData[:paddedLength])
+
+	// 3. Split the data into shards with error handling
 	shards, err := enc.Split(originalData)
 	if err != nil {
 		log.Fatalf("Failed to split data: %v", err)
 	}
 
 	fmt.Println("\nData split into shards:")
-	printShards(shards, dataShards, parityShards)
+	printShards(shards, dataShards, parityShards, paddedLength)
 
-	// 4. Encode parity shards
+	// 4. Encode parity shards with progress indication
+	fmt.Print("\nGenerating parity shards... ")
 	err = enc.Encode(shards)
 	if err != nil {
 		log.Fatalf("Failed to encode parity: %v", err)
 	}
+	fmt.Println("Done")
 
-	fmt.Println("\nParity shards generated:")
-	printShards(shards, dataShards, parityShards)
+	fmt.Println("\nAll shards (data + parity):")
+	printShards(shards, dataShards, parityShards, paddedLength)
 
-	// 5. Verify the shards are valid
+	// 5. Verify initial shard integrity
+	fmt.Print("\nVerifying shard integrity... ")
 	ok, err := enc.Verify(shards)
 	if err != nil {
 		log.Fatalf("Verification failed: %v", err)
 	}
 	if ok {
-		fmt.Println("\nShard verification successful - all shards intact")
+		fmt.Println("All shards intact and valid")
 	} else {
-		fmt.Println("\nShard verification failed - some shards corrupted")
+		log.Fatal("Shard verification failed - data corruption detected")
 	}
 
-	// 6. Simulate data loss - let's corrupt/lose some shards
+	// 6. Simulate data loss scenarios
 	lostShards := []int{0, 4} // Losing data shard 0 and parity shard 1
 	fmt.Printf("\nSimulating loss of shards: %v\n", lostShards)
 
-	// Create a copy of shards for simulation
+	// Create a copy of shards for simulation (preserve originals)
 	corruptedShards := make([][]byte, len(shards))
-	copy(corruptedShards, shards)
-	for _, lost := range lostShards {
-		// Set to nil to simulate complete loss
-		corruptedShards[lost] = nil
+	for i := range shards {
+		if contains(lostShards, i) {
+			continue // Leave as nil to simulate loss
+		}
+		corruptedShards[i] = make([]byte, len(shards[i]))
+		copy(corruptedShards[i], shards[i])
 	}
 
-	// 7. Verify we now have corrupted data
+	fmt.Println("\nCorrupted shards state:")
+	printShards(corruptedShards, dataShards, parityShards, paddedLength)
+
+	// 7. Verify corruption is detected
+	fmt.Print("\nVerifying corrupted shards... ")
 	ok, err = enc.Verify(corruptedShards)
 	if err != nil {
-		log.Printf("Verification failed (expected): %v", err)
-	}
-	if !ok {
-		fmt.Println("Verification correctly detects we have missing shards")
+		fmt.Printf("Expected verification failure: %v\n", err)
+	} else if !ok {
+		fmt.Println("Correctly detected missing shards")
+	} else {
+		log.Fatal("Verification should have failed but didn't")
 	}
 
 	// 8. Reconstruct the lost shards
+	fmt.Print("\nReconstructing missing shards... ")
 	err = enc.Reconstruct(corruptedShards)
 	if err != nil {
 		log.Fatalf("Failed to reconstruct: %v", err)
 	}
+	fmt.Println("Success")
 
-	fmt.Println("\nMissing shards reconstructed successfully")
-	printShards(corruptedShards, dataShards, parityShards)
+	fmt.Println("\nReconstructed shards state:")
+	printShards(corruptedShards, dataShards, parityShards, paddedLength)
 
-	// 9. Verify reconstruction was successful
+	// 9. Verify reconstruction
+	fmt.Print("\nVerifying reconstructed shards... ")
 	ok, err = enc.Verify(corruptedShards)
 	if err != nil {
 		log.Fatalf("Verification failed: %v", err)
 	}
 	if ok {
-		fmt.Println("\nFinal verification successful - all data recovered")
+		fmt.Println("All shards valid - data fully recovered")
 	} else {
-		fmt.Println("\nFinal verification failed - data recovery incomplete")
+		log.Fatal("Reconstruction verification failed")
 	}
 
 	// 10. Join the shards to recover original data
+	fmt.Print("\nReassembling original data... ")
 	buf := new(bytes.Buffer)
 	err = enc.Join(buf, corruptedShards, len(originalData))
 	if err != nil {
 		log.Fatalf("Failed to join shards: %v", err)
 	}
-	recoveredData := buf.Bytes()
-
-	// Remove padding if we added any
-	if len(recoveredData) > len(originalData) {
-		recoveredData = recoveredData[:len(originalData)]
-	}
+	recoveredData := buf.Bytes()[:paddedLength] // Remove padding
+	fmt.Println("Done")
 
 	fmt.Printf("\nRecovered data (%d bytes):\n%s\n", len(recoveredData), recoveredData)
 
-	// 11. Verify the recovered data matches original
-	if bytes.Equal(originalData, recoveredData) {
+	// 11. Validate data recovery
+	if bytes.Equal(originalData[:paddedLength], recoveredData) {
 		fmt.Println("\nSUCCESS: Recovered data matches original exactly!")
 	} else {
-		fmt.Println("\nFAILURE: Recovered data does NOT match original")
+		log.Fatal("\nFAILURE: Recovered data does NOT match original")
 	}
+
+	// Bonus: Save shards to files to demonstrate practical use
+	saveShardsToFiles(shards, dataShards, "shard_%d.dat", "shard_%d.parity")
 }
 
-// printShards prints the shards in a readable format
-func printShards(shards [][]byte, dataShards, parityShards int) {
+// printShards prints the shards with proper formatting and length handling
+func printShards(shards [][]byte, dataShards, parityShards int, originalLength int) {
+	shardSize := originalLength / dataShards
+	if originalLength%dataShards != 0 {
+		shardSize++
+	}
+
 	for i, shard := range shards {
 		if shard == nil {
 			if i < dataShards {
-				fmt.Printf("  Data shard %d: [LOST]\n", i)
+				fmt.Printf("  Data shard %d: [LOST/MISSING]\n", i)
 			} else {
-				fmt.Printf("  Parity shard %d: [LOST]\n", i-dataShards)
+				fmt.Printf("  Parity shard %d: [LOST/MISSING]\n", i-dataShards)
 			}
 			continue
 		}
 
 		if i < dataShards {
-			fmt.Printf("  Data shard %d: %s\n", i, string(shard))
+			// Calculate actual data length for this shard
+			start := i * shardSize
+			end := start + shardSize
+			if end > originalLength {
+				end = originalLength
+			}
+			actualLength := end - start
+
+			fmt.Printf("  Data shard %d (%d bytes): %q\n",
+				i, actualLength, string(shard[:actualLength]))
 		} else {
-			fmt.Printf("  Parity shard %d: %x...\n", i-dataShards, shard[:min(16, len(shard))])
+			fmt.Printf("  Parity shard %d (%d bytes): %x...\n",
+				i-dataShards, len(shard), shard[:min(8, len(shard))])
 		}
 	}
 }
@@ -155,4 +201,32 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func contains(slice []int, val int) bool {
+	for _, item := range slice {
+		if item == val {
+			return true
+		}
+	}
+	return false
+}
+
+func saveShardsToFiles(shards [][]byte, dataShards int, dataPattern, parityPattern string) {
+	fmt.Println("\nSaving shards to files...")
+	for i, shard := range shards {
+		var filename string
+		if i < dataShards {
+			filename = fmt.Sprintf(dataPattern, i)
+		} else {
+			filename = fmt.Sprintf(parityPattern, i-dataShards)
+		}
+
+		err := os.WriteFile(filename, shard, 0644)
+		if err != nil {
+			log.Printf("Failed to save shard %d to %s: %v", i, filename, err)
+		} else {
+			fmt.Printf("  Saved %s (%d bytes)\n", filename, len(shard))
+		}
+	}
 }
